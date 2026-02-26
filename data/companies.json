@@ -1,0 +1,131 @@
+{
+  "companies": [
+    {
+      "id": 1,
+      "name": "Google",
+      "careers_url": "https://www.google.com/about/careers/applications/",
+      "industry": "Technology",
+      "logo": "🔍"
+    },
+    {
+      "id": 2,
+      "name": "Microsoft",
+      "careers_url": "https://careers.microsoft.com/v2/global/en/search-results",
+      "industry": "Technology",
+      "logo": "Ⓜ️"
+    },
+    {
+      "id": 3,
+      "name": "Apple",
+      "careers_url": "https://jobs.apple.com/en-us/search",
+      "industry": "Technology",
+      "logo": "🍎"
+    },
+    {
+      "id": 4,
+      "name": "Meta",
+      "careers_url": "https://www.metacareers.com/jobsearch/",
+      "industry": "Technology",
+      "logo": "f"
+    },
+    {
+      "id": 5,
+      "name": "Amazon",
+      "careers_url": "https://www.amazon.jobs/en/search",
+      "industry": "Technology",
+      "logo": "🔶"
+    },
+    {
+      "id": 6,
+      "name": "Netflix",
+      "careers_url": "https://jobs.netflix.com/",
+      "industry": "Entertainment/Technology",
+      "logo": "N"
+    },
+    {
+      "id": 7,
+      "name": "OpenAI",
+      "careers_url": "https://openai.com/careers/search/",
+      "industry": "AI/Technology",
+      "logo": "🤖"
+    },
+    {
+      "id": 8,
+      "name": "Palantir",
+      "careers_url": "https://www.palantir.com/careers/open-positions/",
+      "industry": "Data/Defense",
+      "logo": "⬤"
+    },
+    {
+      "id": 9,
+      "name": "Tesla",
+      "careers_url": "https://www.tesla.com/careers",
+      "industry": "Automotive/Energy",
+      "logo": "⚡"
+    },
+    {
+      "id": 11,
+      "name": "Stripe",
+      "careers_url": "https://stripe.com/jobs",
+      "industry": "Fintech",
+      "logo": "💳"
+    },
+    {
+      "id": 12,
+      "name": "Figma",
+      "careers_url": "https://www.figma.com/careers/",
+      "industry": "Design/Technology",
+      "logo": "◉"
+    },
+    {
+      "id": 13,
+      "name": "Canva",
+      "careers_url": "https://www.canva.com/careers/",
+      "industry": "Design/Technology",
+      "logo": "C"
+    },
+    {
+      "id": 14,
+      "name": "Notion",
+      "careers_url": "https://www.notion.so/careers",
+      "industry": "Productivity",
+      "logo": "◻️"
+    },
+    {
+      "id": 15,
+      "name": "Airbnb",
+      "careers_url": "https://www.airbnb.com/careers",
+      "industry": "Travel/Technology",
+      "logo": "🏠"
+    },
+    {
+      "id": 16,
+      "name": "Twilio",
+      "careers_url": "https://www.twilio.com/company/careers",
+      "industry": "Communications",
+      "logo": "📞"
+    },
+    {
+      "id": 17,
+      "name": "GitLab",
+      "careers_url": "https://about.gitlab.com/jobs/",
+      "industry": "DevOps",
+      "logo": "🦊"
+    },
+    {
+      "id": 18,
+      "name": "GitHub",
+      "careers_url": "https://github.com/about/careers",
+      "industry": "Developer Tools",
+      "logo": "🐙"
+    },
+    {
+      "id": 21,
+      "name": "California State Jobs (CalCareers)",
+      "careers_url": "https://calcareers.ca.gov/CalHRPublic/Search/JobSearchResults.aspx",
+      "industry": "Government/Public Sector",
+      "logo": "🐻",
+      "state": "CA"
+    }
+  ]
+}
