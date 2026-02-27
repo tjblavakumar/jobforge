@@ -9,8 +9,11 @@ import json
 import os
 import asyncio
 import textwrap
+import io
+import smtplib
 from datetime import datetime, timedelta, timezone
 import sys
+from email.message import EmailMessage
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -34,6 +37,12 @@ try:
     HAS_OPENAI_INTEGRATION = True
 except Exception:
     HAS_OPENAI_INTEGRATION = False
+
+try:
+    import fitz
+    HAS_PDF_EXPORT = True
+except Exception:
+    HAS_PDF_EXPORT = False
 
 # ============================================================================
 # PAGE CONFIG
@@ -241,7 +250,7 @@ st.markdown("""
 # ============================================================================
 
 if "page" not in st.session_state:
-    st.session_state.page = "Dashboard"
+    st.session_state.page = "Get Started"
 if "profile_loaded" not in st.session_state:
     st.session_state.profile_loaded = False
 if "jobs_data" not in st.session_state:
@@ -250,10 +259,19 @@ if "filter_salary_min" not in st.session_state:
     st.session_state.filter_salary_min = 100000
 if "filter_salary_max" not in st.session_state:
     st.session_state.filter_salary_max = 300000
+if "scrape_mode_real" not in st.session_state:
+    st.session_state.scrape_mode_real = False
+if "pending_real_mode" not in st.session_state:
+    st.session_state.pending_real_mode = False
+if "scrape_mode_request" not in st.session_state:
+    st.session_state.scrape_mode_request = st.session_state.scrape_mode_real
+if "suppress_real_mode_prompt" not in st.session_state:
+    st.session_state.suppress_real_mode_prompt = False
 
 # Initialize database
 init_db()
-seed_demo_jobs()
+if os.getenv("ENABLE_DEMO_SEED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+    seed_demo_jobs()
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -297,16 +315,25 @@ def load_jobs_from_db():
     return jobs
 
 def get_user_profile():
-    """Get or create user profile"""
+    """Get or create active user profile."""
     session = get_db_session()
-    profile = session.query(Profile).first()
+    selected_profile_id = st.session_state.get("active_profile_id")
+    profile = None
+    if selected_profile_id:
+        profile = session.query(Profile).filter_by(id=selected_profile_id).first()
+
+    if not profile:
+        profile = session.query(Profile).order_by(Profile.id.asc()).first()
     
     if not profile:
         profile = Profile(user_name="User")
         session.add(profile)
         session.commit()
+
+    st.session_state.active_profile_id = profile.id
     
     return {
+        "id": profile.id,
         "name": profile.user_name or "User",
         "title": profile.current_title or "Professional",
         "years_exp": profile.years_experience or 0,
@@ -315,11 +342,34 @@ def get_user_profile():
         "education": json.loads(profile.education) if profile.education else []
     }
 
-def save_profile(data):
-    """Save profile to database"""
+
+def list_profiles():
+    """Return all profiles as normalized dictionaries."""
     session = get_db_session()
-    profile = session.query(Profile).first()
-    
+    profiles = session.query(Profile).order_by(Profile.id.asc()).all()
+
+    normalized = []
+    for profile in profiles:
+        normalized.append(
+            {
+                "id": profile.id,
+                "name": profile.user_name or f"Profile {profile.id}",
+                "title": profile.current_title or "Professional",
+                "years_exp": profile.years_experience or 0,
+                "skills": json.loads(profile.skills) if profile.skills else [],
+                "summary": profile.summary or "",
+                "education": json.loads(profile.education) if profile.education else [],
+            }
+        )
+    return normalized
+
+def save_profile(data, profile_id=None):
+    """Save profile to database."""
+    session = get_db_session()
+    profile = None
+    if profile_id:
+        profile = session.query(Profile).filter_by(id=profile_id).first()
+
     if not profile:
         profile = Profile()
     
@@ -332,21 +382,66 @@ def save_profile(data):
     
     session.merge(profile)
     session.commit()
+    st.session_state.active_profile_id = profile.id
 
 def get_settings():
     """Get settings from st.secrets or env"""
+    try:
+        secrets = dict(st.secrets)
+    except Exception:
+        secrets = {}
+
+    def _get_value(key, default=""):
+        value = secrets.get(key)
+        if value is None or value == "":
+            value = os.getenv(key, default)
+        return value
+
+    def _get_int_value(key, default):
+        value = _get_value(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _get_bool_value(key, default=False):
+        value = _get_value(key, str(default))
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
     if "openai_key_override" in st.session_state:
         openai_key = st.session_state.get("openai_key_override", "")
     else:
-        openai_key = st.secrets.get("OPENAI_API_KEY", "")
+        openai_key = _get_value("OPENAI_API_KEY", "")
+
+    blacklist_raw = _get_value("BLACKLIST", "")
+    if isinstance(blacklist_raw, list):
+        blacklist = [str(item).strip() for item in blacklist_raw if str(item).strip()]
+    else:
+        blacklist = [item.strip() for item in str(blacklist_raw).split(",") if item.strip()]
 
     settings = {
         "openai_key": openai_key,
-        "location": st.secrets.get("LOCATION", "US"),
-        "min_salary": st.secrets.get("MIN_SALARY", 100000),
-        "exp_level": st.secrets.get("EXP_LEVEL", "senior"),
-        "blacklist": st.secrets.get("BLACKLIST", "").split(",") if st.secrets.get("BLACKLIST") else []
+        "location": _get_value("LOCATION", "US"),
+        "min_salary": _get_int_value("MIN_SALARY", 100000),
+        "exp_level": _get_value("EXP_LEVEL", "senior"),
+        "blacklist": blacklist,
+        "alerts_enabled": _get_bool_value("ALERTS_ENABLED", False),
+        "alert_min_score": _get_int_value("ALERT_MIN_SCORE", 80),
+        "alert_max_items": _get_int_value("ALERT_MAX_ITEMS", 10),
+        "smtp_host": _get_value("SMTP_HOST", ""),
+        "smtp_port": _get_int_value("SMTP_PORT", 587),
+        "smtp_user": _get_value("SMTP_USER", ""),
+        "smtp_password": _get_value("SMTP_PASSWORD", ""),
+        "alert_email_to": _get_value("ALERT_EMAIL_TO", ""),
+        "alert_email_from": _get_value("ALERT_EMAIL_FROM", "")
     }
+
+    session_override = st.session_state.get("settings_override")
+    if isinstance(session_override, dict):
+        settings.update(session_override)
+
     return settings
 
 def save_settings(settings):
@@ -420,6 +515,248 @@ def run_async_task(coro):
     return asyncio.run(coro)
 
 
+async def scrape_mock_companies_parallel(companies, limit=2, max_concurrency=5):
+    """Scrape multiple companies in parallel using mock scraper."""
+    safe_concurrency = max(1, int(max_concurrency))
+    semaphore = asyncio.Semaphore(safe_concurrency)
+
+    async def scrape_one(company):
+        async with semaphore:
+            try:
+                jobs = await scraper.scrape_company(company["name"], company["careers_url"], limit=limit)
+            except Exception:
+                jobs = []
+            return company.get("name", "Unknown"), jobs
+
+    tasks = [scrape_one(company) for company in companies]
+    results = await asyncio.gather(*tasks)
+    return {company_name: jobs for company_name, jobs in results}
+
+
+def get_alert_state_path():
+    """Path for persisted job alert state."""
+    return os.path.join(os.path.dirname(__file__), "data", "alerts_state.json")
+
+
+def load_alert_state():
+    """Load persisted alert state."""
+    path = get_alert_state_path()
+    if not os.path.exists(path):
+        return {"seen_job_ids": [], "last_checked_at": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+            if not isinstance(state, dict):
+                return {"seen_job_ids": [], "last_checked_at": None}
+            state.setdefault("seen_job_ids", [])
+            state.setdefault("last_checked_at", None)
+            return state
+    except Exception:
+        return {"seen_job_ids": [], "last_checked_at": None}
+
+
+def save_alert_state(state):
+    """Persist alert state to disk."""
+    path = get_alert_state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def get_new_alert_jobs(min_score=80, max_items=10):
+    """Find unseen jobs above threshold score."""
+    jobs = load_jobs_from_db()
+    state = load_alert_state()
+    seen_ids = {int(job_id) for job_id in state.get("seen_job_ids", []) if str(job_id).isdigit()}
+
+    candidates = [
+        job for job in jobs
+        if int(job.get("id", 0) or 0) not in seen_ids and float(job.get("match_score", 0)) >= float(min_score)
+    ]
+
+    candidates.sort(
+        key=lambda x: (
+            x.get("posted_date") or datetime(1970, 1, 1, tzinfo=timezone.utc),
+            float(x.get("match_score", 0))
+        ),
+        reverse=True
+    )
+    return candidates[:max(1, int(max_items))]
+
+
+def mark_alert_jobs_seen(jobs):
+    """Mark alert jobs as seen to avoid duplicate alerts."""
+    state = load_alert_state()
+    seen_ids = set(state.get("seen_job_ids", []))
+    for job in jobs:
+        job_id = int(job.get("id", 0) or 0)
+        if job_id:
+            seen_ids.add(job_id)
+    state["seen_job_ids"] = sorted(seen_ids)
+    state["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+    save_alert_state(state)
+
+
+def send_job_alert_email(jobs, settings):
+    """Send job alerts via SMTP when settings are configured."""
+    smtp_host = (settings.get("smtp_host") or "").strip()
+    smtp_port = int(settings.get("smtp_port") or 587)
+    smtp_user = (settings.get("smtp_user") or "").strip()
+    smtp_password = (settings.get("smtp_password") or "").strip()
+    email_to = (settings.get("alert_email_to") or "").strip()
+    email_from = (settings.get("alert_email_from") or smtp_user).strip()
+
+    if not jobs:
+        return False, "No new jobs to send."
+    if not smtp_host or not email_to or not email_from:
+        return False, "SMTP/email settings missing (SMTP_HOST, ALERT_EMAIL_TO, ALERT_EMAIL_FROM)."
+
+    lines = [
+        f"JobForge found {len(jobs)} new high-match jobs:",
+        ""
+    ]
+    for idx, job in enumerate(jobs, start=1):
+        salary = get_salary_range_display(job.get("salary_min"), job.get("salary_max"))
+        posted = format_date(job.get("posted_date"))
+        lines.append(
+            f"{idx}. {job.get('title', 'Job')} @ {job.get('company', 'Company')} | "
+            f"Match {float(job.get('match_score', 0)):.0f}% | {salary} | {posted}"
+        )
+        if job.get("link") and job.get("link") != "manual-entry":
+            lines.append(f"   {job['link']}")
+    body = "\n".join(lines)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"JobForge Alerts: {len(jobs)} New Matches"
+    msg["From"] = email_from
+    msg["To"] = email_to
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        return True, f"Alert email sent to {email_to}."
+    except Exception as exc:
+        return False, f"Email send failed: {str(exc)[:140]}"
+
+
+def jobs_to_export_rows(jobs):
+    """Normalize job rows for exports."""
+    rows = []
+    for job in jobs:
+        posted_date = job.get("posted_date")
+        posted_iso = ""
+        if posted_date:
+            if getattr(posted_date, "tzinfo", None) is None:
+                posted_date = posted_date.replace(tzinfo=timezone.utc)
+            posted_iso = posted_date.isoformat()
+
+        rows.append(
+            {
+                "title": job.get("title", ""),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "salary_min": job.get("salary_min") or 0,
+                "salary_max": job.get("salary_max") or 0,
+                "match_score": round(float(job.get("match_score", 0)), 2),
+                "is_remote": bool(job.get("is_remote", False)),
+                "posted_date": posted_iso,
+                "source": job.get("source", ""),
+                "link": job.get("link", ""),
+            }
+        )
+    return rows
+
+
+def export_jobs_csv_bytes(jobs):
+    """Create CSV bytes for job list export."""
+    rows = jobs_to_export_rows(jobs)
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def export_jobs_pdf_bytes(jobs):
+    """Create PDF bytes for job list export."""
+    if not HAS_PDF_EXPORT:
+        return None
+
+    rows = jobs_to_export_rows(jobs)
+    doc = fitz.open()
+
+    page = doc.new_page()
+    page_width = page.rect.width
+    page_height = page.rect.height
+    margin = 36
+    y = margin
+    line_height = 14
+    max_y = page_height - margin
+
+    def add_line(text):
+        nonlocal page, y
+        if y + line_height > max_y:
+            page = doc.new_page()
+            y = margin
+        page.insert_text((margin, y), text, fontsize=10)
+        y += line_height
+
+    header = f"JobForge Export | Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    add_line(header)
+    add_line(f"Total Jobs: {len(rows)}")
+    add_line("-" * int((page_width - margin * 2) / 6))
+
+    for idx, row in enumerate(rows, start=1):
+        salary = get_salary_range_display(row.get("salary_min"), row.get("salary_max"))
+        heading = (
+            f"{idx}. {row.get('title', 'Job')} @ {row.get('company', 'Company')} "
+            f"| Match {row.get('match_score', 0):.0f}%"
+        )
+        add_line(heading)
+        add_line(f"   {row.get('location', 'Unknown')} | {salary} | Remote: {'Yes' if row.get('is_remote') else 'No'}")
+        if row.get("link"):
+            for wrapped in textwrap.wrap(str(row.get("link")), width=95):
+                add_line(f"   {wrapped}")
+        add_line("")
+
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    return pdf_bytes
+
+
+def is_real_scrape_mode():
+    """Global scrape mode from sidebar toggle."""
+    return bool(st.session_state.get("scrape_mode_real", False))
+
+
+def remove_mock_jobs_from_db():
+    """Best-effort cleanup of mock-generated jobs and related metrics."""
+    session = get_db_session()
+    jobs = session.query(Job).all()
+    mock_job_ids = []
+
+    for job in jobs:
+        source = (job.source or "").lower()
+        link = (job.link or "").lower()
+        jd_text = (job.jd_text or "").lower()
+
+        looks_like_mock_source = "mock" in source or "[mock]" in source
+        looks_like_mock_link = "/job-" in link and "careers" not in source
+        looks_like_mock_template = "nice to have" in jd_text and "open source contributions" in jd_text
+
+        if looks_like_mock_source or looks_like_mock_link or looks_like_mock_template:
+            mock_job_ids.append(job.id)
+
+    if not mock_job_ids:
+        return 0
+
+    session.query(JobMetric).filter(JobMetric.job_id.in_(mock_job_ids)).delete(synchronize_session=False)
+    session.query(Job).filter(Job.id.in_(mock_job_ids)).delete(synchronize_session=False)
+    session.commit()
+    return len(mock_job_ids)
+
+
 async def scrape_single_job_real_async(url: str, company_name: str = "Unknown"):
     """Scrape a single job URL with Playwright scraper."""
     scraper_instance = PlaywrightScraper(headless=True)
@@ -430,13 +767,15 @@ async def scrape_single_job_real_async(url: str, company_name: str = "Unknown"):
         await scraper_instance.close()
 
 
-def persist_jobs(jobs):
+def persist_jobs(jobs, selected_profiles=None):
     """Insert/update scraped jobs and compute match scores."""
     if not jobs:
         return 0, 0
 
     session = get_db_session()
-    profile = get_user_profile()
+    profiles = selected_profiles or [get_user_profile()]
+    if not profiles:
+        profiles = [get_user_profile()]
     settings = get_settings()
     api_key = (settings.get("openai_key") or "").strip()
     use_openai = bool(api_key)
@@ -466,40 +805,53 @@ def persist_jobs(jobs):
         db_job.is_remote = bool(job.get("is_remote", False))
         db_job.jd_text = job.get("jd_text", "")
         db_job.posted_date = job.get("posted_date") or datetime.now(timezone.utc)
-        db_job.source = job.get("source", db_job.company)
+        source_value = job.get("source", db_job.company)
+        data_mode = str(job.get("data_mode", "")).strip().lower()
+        if data_mode == "mock" and "mock" not in str(source_value).lower():
+            source_value = f"{source_value} [Mock]"
+        elif data_mode == "real" and "real" not in str(source_value).lower():
+            source_value = f"{source_value} [Real]"
+        db_job.source = source_value
 
         session.merge(db_job)
         session.flush()
 
-        score, breakdown = matcher.score_job(
-            {
-                "title": db_job.title,
-                "company": db_job.company,
-                "location": db_job.location,
-                "salary_min": db_job.salary_min,
-                "salary_max": db_job.salary_max,
-                "is_remote": db_job.is_remote,
-                "jd_text": db_job.jd_text,
-            },
-            {
-                "title": profile.get("title", "Professional"),
-                "years_exp": profile.get("years_exp", 0),
-                "skills": profile.get("skills", []),
-                "summary": profile.get("summary", ""),
-                "prefer_remote": True,
-                "expected_salary_min": int(settings.get("min_salary", 100000)),
-                "expected_salary_max": int(settings.get("min_salary", 100000)) + 150000,
-            }
-        )
+        best_score = 0.0
+        best_breakdown = {"semantic_match": 0.0, "openai_score": 0.0}
+
+        for profile in profiles:
+            score, breakdown = matcher.score_job(
+                {
+                    "title": db_job.title,
+                    "company": db_job.company,
+                    "location": db_job.location,
+                    "salary_min": db_job.salary_min,
+                    "salary_max": db_job.salary_max,
+                    "is_remote": db_job.is_remote,
+                    "jd_text": db_job.jd_text,
+                },
+                {
+                    "title": profile.get("title", "Professional"),
+                    "years_exp": profile.get("years_exp", 0),
+                    "skills": profile.get("skills", []),
+                    "summary": profile.get("summary", ""),
+                    "prefer_remote": True,
+                    "expected_salary_min": int(settings.get("min_salary", 100000)),
+                    "expected_salary_max": int(settings.get("min_salary", 100000)) + 150000,
+                }
+            )
+            if float(score) >= float(best_score):
+                best_score = float(score)
+                best_breakdown = breakdown or {"semantic_match": 0.0, "openai_score": 0.0}
 
         metric = session.query(JobMetric).filter_by(job_id=db_job.id).first()
         if not metric:
             metric = JobMetric(job_id=db_job.id)
             session.add(metric)
 
-        metric.match_score = float(score)
-        metric.semantic_score = float(breakdown.get("semantic_match", 0))
-        metric.openai_score = float(breakdown.get("openai_score", 0))
+        metric.match_score = float(best_score)
+        metric.semantic_score = float(best_breakdown.get("semantic_match", 0))
+        metric.openai_score = float(best_breakdown.get("openai_score", 0))
 
     session.commit()
     return inserted, updated
@@ -516,6 +868,26 @@ def update_job_openai_metric(job_id: int, openai_score: float):
     metric.openai_score = float(openai_score)
     metric.match_score = max(0.0, min(100.0, (metric.match_score * 0.95) + (openai_score * 0.05)))
     session.commit()
+
+
+def set_job_saved(job_id: int, saved: bool = True):
+    """Persist saved state for a specific job metric."""
+    session = get_db_session()
+    metric = session.query(JobMetric).filter_by(job_id=job_id).first()
+    if not metric:
+        metric = JobMetric(job_id=job_id)
+        session.add(metric)
+    metric.saved = bool(saved)
+    session.commit()
+
+
+def delete_job_by_id(job_id: int):
+    """Delete a job and its associated metric."""
+    session = get_db_session()
+    session.query(JobMetric).filter_by(job_id=job_id).delete(synchronize_session=False)
+    deleted = session.query(Job).filter_by(id=job_id).delete(synchronize_session=False)
+    session.commit()
+    return bool(deleted)
 
 
 def rescore_all_jobs_with_openai(api_key: str, progress_callback=None):
@@ -586,9 +958,239 @@ def rescore_all_jobs_with_openai(api_key: str, progress_callback=None):
 # PAGE COMPONENTS
 # ============================================================================
 
-def page_dashboard():
-    """Dashboard with job cards and filters"""
-    st.title("💼 Dashboard")
+def page_get_started():
+    """First-run onboarding wizard page."""
+    st.title("🏠 Home")
+    st.caption("Follow these steps in order to use JobForge effectively.")
+
+    profile = get_user_profile()
+    all_profiles = list_profiles()
+    jobs = load_jobs_from_db()
+
+    companies_path = os.path.join(os.path.dirname(__file__), "data", "companies.json")
+    companies_count = 0
+    if os.path.exists(companies_path):
+        try:
+            with open(companies_path, "r", encoding="utf-8") as f:
+                companies_data = json.load(f)
+                companies_count = len(companies_data.get("companies", []))
+        except Exception:
+            companies_count = 0
+
+    has_profile = bool(profile.get("title") and profile.get("skills"))
+    has_companies = companies_count > 0
+    has_jobs = len(jobs) > 0
+
+    completed_steps = sum([has_profile, has_companies, has_jobs])
+    progress = completed_steps / 3
+    st.progress(progress)
+    st.caption(f"Progress: {completed_steps}/3 core setup steps completed")
+
+    step1_col1, step1_col2 = st.columns([0.78, 0.22])
+    with step1_col1:
+        st.markdown("### 1) Build Your Profile")
+        st.caption("Upload resume and confirm skills/title for better match scoring.")
+        st.caption("Status: ✅ Complete" if has_profile else "Status: ⏳ Not complete")
+    with step1_col2:
+        if st.button("Go to Profile", use_container_width=True):
+            st.session_state.page = "Profile"
+            st.rerun()
+
+    step2_col1, step2_col2 = st.columns([0.78, 0.22])
+    with step2_col1:
+        st.markdown("### 2) Configure Sources")
+        st.caption("Review companies and run scans to pull open roles into your database.")
+        st.caption("Status: ✅ Complete" if has_companies else "Status: ⏳ Not complete")
+    with step2_col2:
+        if st.button("Go to Companies", use_container_width=True):
+            st.session_state.page = "Preferred Companies"
+            st.rerun()
+
+    step3_col1, step3_col2 = st.columns([0.78, 0.22])
+    with step3_col1:
+        st.markdown("### 3) Review and Act")
+        st.caption("Use Dashboard filters, save presets, analyze with OpenAI, and export results.")
+        st.caption("Status: ✅ Complete" if has_jobs else "Status: ⏳ Not complete")
+    with step3_col2:
+        st.button("View Results Below", use_container_width=True, disabled=True)
+
+    st.markdown("---")
+    st.subheader("Recommended Flow")
+    st.markdown(
+        "1. Profile → 2. Settings (OpenAI optional) → 3. Preferred Companies → 4. Scan + review results on Home"
+    )
+
+    quick_col1, quick_col2 = st.columns(2)
+    with quick_col1:
+        if st.button("⚙️ Open Settings", use_container_width=True):
+            st.session_state.page = "Settings"
+            st.rerun()
+    with quick_col2:
+        if st.button("➕ Add Job Manually", use_container_width=True):
+            st.session_state.page = "Add Job"
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("🔄 Scan Active Companies for Matching Jobs")
+    use_real_scraper = is_real_scrape_mode()
+    st.caption(
+        "Real Scraper Mode: ON" if use_real_scraper else "Real Scraper Mode: OFF (mock generation)"
+    )
+
+    companies_path = os.path.join(os.path.dirname(__file__), "data", "companies.json")
+    companies = []
+    if os.path.exists(companies_path):
+        try:
+            with open(companies_path, "r", encoding="utf-8") as f:
+                companies_data = json.load(f)
+                companies = companies_data.get("companies", [])[:100]
+        except Exception:
+            companies = []
+
+    active_companies = [company for company in companies if bool(company.get("active", True))]
+    if not active_companies:
+        st.info("No active companies found. Activate companies in Preferred Companies page first.")
+        st.markdown("---")
+        page_dashboard(show_title=False, show_back_button=False)
+        return
+
+    profile_options = [f"{p['name']} (ID {p['id']})" for p in all_profiles]
+    profile_label_to_id = {f"{p['name']} (ID {p['id']})": p["id"] for p in all_profiles}
+
+    selected_profile_labels = st.multiselect(
+        "Select Profiles for Matching",
+        options=profile_options,
+        default=profile_options[:1] if profile_options else [],
+        key="gs_selected_profiles"
+    )
+    selected_profile_ids = [profile_label_to_id[label] for label in selected_profile_labels]
+    selected_profiles = [p for p in all_profiles if p.get("id") in selected_profile_ids]
+
+    if not selected_profiles:
+        st.warning("Select at least one profile before scanning.")
+        st.markdown("---")
+        page_dashboard(show_title=False, show_back_button=False)
+        return
+
+    max_jobs = st.slider("Max jobs per company", min_value=1, max_value=5, value=2, key="gs_max_jobs")
+    max_concurrency = st.slider("Parallel scans", min_value=1, max_value=8, value=4, key="gs_max_concurrency")
+
+    scan_col1, scan_col2 = st.columns(2)
+
+    with scan_col1:
+        st.markdown("**Scan Single Company**")
+        selected_company = st.selectbox(
+            "Select Active Company",
+            [c["name"] for c in active_companies],
+            key="gs_selected_company"
+        )
+        if st.button("🔍 Scan Selected Company", use_container_width=True, key="gs_scan_single"):
+            company = next((c for c in active_companies if c["name"] == selected_company), None)
+            if not company:
+                st.error("Selected company not found.")
+            else:
+                progress_bar = st.progress(0)
+                progress_status = st.empty()
+                progress_status.text(f"Scanning {selected_company}...")
+                progress_bar.progress(15)
+
+                jobs = []
+                if use_real_scraper:
+                    if not HAS_REAL_SCRAPER:
+                        st.error("Real scraper mode is ON, but Playwright scraper is unavailable.")
+                    else:
+                        try:
+                            jobs = scrape_companies_real(
+                                [company],
+                                max_jobs_per_company=max_jobs,
+                                max_concurrency=max_concurrency
+                            )
+                        except Exception as e:
+                            st.error(f"Real scraper failed in strict real mode. Reason: {str(e)[:120]}")
+                else:
+                    jobs = run_async_task(scraper.scrape_company(company["name"], company["careers_url"], limit=max_jobs))
+
+                progress_status.text("Persisting scanned jobs to database...")
+                progress_bar.progress(90)
+                if not jobs:
+                    progress_bar.progress(100)
+                    progress_status.text(f"Completed scan for {selected_company} with 0 valid jobs.")
+                    st.warning("No valid job-detail pages found. Existing results were kept unchanged.")
+                else:
+                    session = get_db_session()
+                    session.query(JobMetric).delete(synchronize_session=False)
+                    session.query(Job).delete(synchronize_session=False)
+                    session.commit()
+                    session.close()
+                    inserted, updated = persist_jobs(jobs, selected_profiles=selected_profiles)
+                    progress_bar.progress(100)
+                    progress_status.text(f"Completed scan for {selected_company}.")
+                    st.success(f"✅ {selected_company} scan complete: {len(jobs)} jobs ({inserted} new, {updated} updated).")
+
+    with scan_col2:
+        st.markdown("**Scan All Active Companies**")
+        if st.button("🔍 Scan All Active Companies", use_container_width=True, key="gs_scan_all"):
+            progress_bar = st.progress(0)
+            progress_status = st.empty()
+
+            total_companies = len(active_companies)
+            jobs = []
+            progress_status.text(f"Running scan for {total_companies} active companies...")
+            progress_bar.progress(20)
+
+            if use_real_scraper:
+                if not HAS_REAL_SCRAPER:
+                    st.error("Real scraper mode is ON, but Playwright scraper is unavailable.")
+                    jobs = []
+                else:
+                    try:
+                        jobs = scrape_companies_real(
+                            active_companies,
+                            max_jobs_per_company=max_jobs,
+                            max_concurrency=max_concurrency
+                        )
+                    except Exception as e:
+                        st.error(f"Real scraper failed in strict real mode. Reason: {str(e)[:120]}")
+                        jobs = []
+            else:
+                jobs_by_company = run_async_task(
+                    scrape_mock_companies_parallel(
+                        active_companies,
+                        limit=max_jobs,
+                        max_concurrency=max_concurrency
+                    )
+                )
+                jobs = [job for company_jobs in jobs_by_company.values() for job in company_jobs]
+
+            progress_status.text("Persisting scanned jobs to database...")
+            progress_bar.progress(92)
+            if not jobs:
+                progress_bar.progress(100)
+                progress_status.text(f"Completed {total_companies}/{total_companies} companies with 0 valid jobs.")
+                st.warning("No valid job-detail pages found. Existing results were kept unchanged.")
+            else:
+                session = get_db_session()
+                session.query(JobMetric).delete(synchronize_session=False)
+                session.query(Job).delete(synchronize_session=False)
+                session.commit()
+                session.close()
+                inserted, updated = persist_jobs(jobs, selected_profiles=selected_profiles)
+                progress_bar.progress(100)
+                progress_status.text(f"Completed {total_companies}/{total_companies} companies.")
+                st.success(f"✅ Scan complete: {len(jobs)} jobs processed ({inserted} new, {updated} updated).")
+
+    st.markdown("---")
+    page_dashboard(show_title=False, show_back_button=False)
+
+def page_dashboard(show_title=True, show_back_button=True):
+    """Dashboard with job cards and filters."""
+    if show_title:
+        st.title("💼 Dashboard")
+
+    if show_back_button:
+        if st.button("← Back to Home", key="dashboard_back_home"):
+            st.session_state.page = "Get Started"
+            st.rerun()
     
     jobs = load_jobs_from_db()
     user_profile = get_user_profile()
@@ -811,6 +1413,38 @@ def page_dashboard():
     st.markdown("---")
     st.caption(" | ".join(active_filters))
     st.subheader(f"📋 Jobs ({len(filtered_jobs)} / {len(jobs)})")
+
+    export_col1, export_col2 = st.columns(2)
+    csv_bytes = export_jobs_csv_bytes(filtered_jobs)
+    export_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    with export_col1:
+        st.download_button(
+            "⬇️ Export CSV",
+            data=csv_bytes,
+            file_name=f"jobforge_jobs_{export_timestamp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=not filtered_jobs
+        )
+    with export_col2:
+        if HAS_PDF_EXPORT:
+            pdf_bytes = export_jobs_pdf_bytes(filtered_jobs)
+            st.download_button(
+                "⬇️ Export PDF",
+                data=pdf_bytes,
+                file_name=f"jobforge_jobs_{export_timestamp}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                disabled=not filtered_jobs
+            )
+        else:
+            st.button("⬇️ Export PDF", disabled=True, use_container_width=True)
+
+    if settings.get("alerts_enabled"):
+        min_score = int(settings.get("alert_min_score", 80))
+        max_items = int(settings.get("alert_max_items", 10))
+        pending_alerts = get_new_alert_jobs(min_score=min_score, max_items=max_items)
+        st.caption(f"🔔 Job Alerts: {len(pending_alerts)} unseen matches at score ≥ {min_score}")
     
     if not filtered_jobs:
         st.info("😔 No jobs match your filters. Try adjusting them!")
@@ -886,20 +1520,105 @@ def page_dashboard():
                         st.button("🔗 Open", disabled=True, use_container_width=True, key=f"open_disabled_{job['id']}")
                 with action_col2:
                     if st.button("💾 Save", key=f"save_{job['id']}", use_container_width=True):
-                        st.success("✅ Saved!")
+                        set_job_saved(job["id"], True)
+                        st.success("✅ Saved! See Saved Jobs page.")
+                        st.rerun()
                 with action_col3:
-                    if st.button("✓ View", key=f"view_{job['id']}", use_container_width=True):
-                        st.info(f"Marked as viewed: {job['title']}")
-                with action_col4:
                     if st.button("❌ Remove", key=f"reject_{job['id']}", use_container_width=True):
-                        st.info(f"Rejected {job['title']}")
+                        removed = delete_job_by_id(job["id"])
+                        if removed:
+                            st.success(f"Removed {job['title']}")
+                            st.rerun()
+                        else:
+                            st.warning("Job not found.")
+
+
+def page_saved_jobs():
+    """View and manage saved jobs."""
+    st.title("⭐ Saved Jobs")
+
+    if st.button("← Back to Home", key="saved_jobs_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
+
+    jobs = [job for job in load_jobs_from_db() if bool(job.get("saved"))]
+    jobs.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+
+    st.caption(f"Saved jobs: {len(jobs)}")
+    if not jobs:
+        st.info("No saved jobs yet. Save jobs from Dashboard.")
+        return
+
+    for job in jobs:
+        salary_display = get_salary_range_display(job.get("salary_min"), job.get("salary_max"))
+        with st.container(border=True):
+            left, right = st.columns([0.78, 0.22])
+            with left:
+                st.markdown(f"### {job.get('title', 'Job')}")
+                st.caption(f"{job.get('company', 'Company')} • {job.get('location', 'Unknown')} • 💵 {salary_display}")
+            with right:
+                st.metric("Match", f"{float(job.get('match_score', 0)):.0f}%")
+
+            action_col1, action_col2 = st.columns(2)
+            with action_col1:
+                if job.get("link") and job.get("link") != "manual-entry":
+                    st.link_button("🔗 Open", job["link"], use_container_width=True)
+                else:
+                    st.button("🔗 Open", disabled=True, use_container_width=True, key=f"saved_open_disabled_{job['id']}")
+            with action_col2:
+                if st.button("🗑️ Delete", key=f"saved_delete_{job['id']}", use_container_width=True):
+                    removed = delete_job_by_id(job["id"])
+                    if removed:
+                        st.success(f"Deleted {job.get('title', 'job')}")
+                        st.rerun()
+                    else:
+                        st.warning("Job not found.")
 
 
 def page_profile():
     """Profile setup page"""
     st.title("👤 Your Profile")
+
+    if st.button("← Back to Home", key="profile_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
     
-    profile = get_user_profile()
+    profiles = list_profiles()
+    if not profiles:
+        _ = get_user_profile()
+        profiles = list_profiles()
+
+    profile_map = {f"{p['name']} (ID {p['id']})": p for p in profiles}
+    profile_labels = list(profile_map.keys())
+
+    active_id = st.session_state.get("active_profile_id")
+    default_index = 0
+    for idx, p in enumerate(profiles):
+        if p.get("id") == active_id:
+            default_index = idx
+            break
+
+    select_col, create_col = st.columns([0.75, 0.25])
+    with select_col:
+        selected_label = st.selectbox("Select Profile", profile_labels, index=default_index)
+    with create_col:
+        if st.button("➕ New Profile", use_container_width=True, key="create_new_profile"):
+            save_profile(
+                {
+                    "name": f"Profile {len(profiles) + 1}",
+                    "title": "Professional",
+                    "years_exp": 0,
+                    "skills": [],
+                    "summary": "",
+                    "education": [],
+                },
+                profile_id=None,
+            )
+            st.success("Created new profile.")
+            st.rerun()
+
+    profile = profile_map[selected_label]
+    st.session_state.active_profile_id = profile.get("id")
     
     st.subheader("📄 Resume Upload")
     uploaded_file = st.file_uploader("Upload Resume (PDF or DOCX)", type=["pdf", "docx"])
@@ -957,20 +1676,17 @@ def page_profile():
             "summary": summary,
             "education": education
         }
-        save_profile(profile_data)
+        save_profile(profile_data, profile_id=profile.get("id"))
         st.success("✅ Profile saved!")
 
 
 def page_companies():
-    """Browse and scan preferred companies"""
+    """Manage preferred companies"""
     st.title("🏢 Preferred Companies")
 
-    def is_california_job(job: dict) -> bool:
-        location = (job.get("location") or "").lower()
-        if "california" in location or ", ca" in location:
-            return True
-        ca_cities = ["sacramento", "los angeles", "san diego", "oakland", "san francisco", "fresno", "san jose"]
-        return any(city in location for city in ca_cities)
+    if st.button("← Back to Home", key="companies_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
 
     def normalize_url(url: str) -> str:
         cleaned = (url or "").strip()
@@ -1082,17 +1798,9 @@ def page_companies():
                     st.rerun()
 
     with manage_col2:
-        st.markdown("**Delete Company**")
-        company_names = [c.get("name", "") for c in companies]
-        if not company_names:
-            st.caption("No companies to delete.")
-        else:
-            delete_name = st.selectbox("Select Company to Delete", company_names)
-            if st.button("🗑️ Delete Company", use_container_width=True):
-                updated_companies = [c for c in companies if c.get("name") != delete_name]
-                save_companies(companies_path, updated_companies)
-                st.success(f"Deleted {delete_name}.")
-                st.rerun()
+        st.markdown("**How this page works**")
+        st.caption("Use the table below to activate/deactivate companies and delete rows directly.")
+        st.caption("Only active companies are used during scans.")
 
     st.markdown("---")
     st.subheader("🔗 Validate Existing Careers URL")
@@ -1118,172 +1826,98 @@ def page_companies():
     else:
         st.caption("No companies available to validate.")
 
-    company_location_filter = st.selectbox(
-        "Location Filter",
-        ["All", "California Only"],
-        help="Filter company cards and scans to California-focused sources."
-    )
-
     filtered_companies = companies
-    if company_location_filter == "California Only":
-        filtered_companies = [
-            company for company in companies
-            if company.get("state") == "CA"
-            or "california" in company.get("name", "").lower()
-            or "ca.gov" in company.get("careers_url", "").lower()
-            or "calcareers" in company.get("careers_url", "").lower()
-        ]
 
     if not filtered_companies:
         st.info("No companies match the current location filter.")
-    
+
     st.markdown("---")
-    
-    # Display companies in grid
-    cols = st.columns(4)
-    for i, company in enumerate(filtered_companies):
-        with cols[i % 4]:
+    st.subheader("📋 Companies")
+
+    if filtered_companies:
+        header_cols = st.columns([2.2, 1.4, 1.0, 2.7, 1.0, 1.2, 1.0])
+        header_cols[0].markdown("**Company**")
+        header_cols[1].markdown("**Industry**")
+        header_cols[2].markdown("**State**")
+        header_cols[3].markdown("**Careers URL**")
+        header_cols[4].markdown("**Status**")
+        header_cols[5].markdown("**Activate**")
+        header_cols[6].markdown("**Delete**")
+
+        for company in filtered_companies:
+            active = bool(company.get("active", True))
+            row_cols = st.columns([2.2, 1.4, 1.0, 2.7, 1.0, 1.2, 1.0])
+            row_cols[0].markdown(f"{company.get('logo', '🏢')} {company.get('name', 'Unknown')}")
+            row_cols[1].write(company.get("industry", "-"))
+            row_cols[2].write(company.get("state", "-"))
+
             careers_url = normalize_url(company.get("careers_url", ""))
-            st.markdown(f"""
-            <div style="
-                background: white;
-                border: 1px solid #e5e7eb;
-                border-radius: 0.5rem;
-                padding: 1rem;
-                text-align: center;
-                margin: 0.5rem 0;
-                cursor: pointer;
-                transition: all 0.3s;
-            ">
-                <div style="font-size: 2rem; margin-bottom: 0.5rem;">{company['logo']}</div>
-                <h4 style="margin: 0.5rem 0; font-size: 0.9rem;">{company['name']}</h4>
-                <p style="margin: 0.25rem 0; font-size: 0.75rem; color: #9ca3af;">{company['industry']}</p>
-            </div>
-            """, unsafe_allow_html=True)
             if careers_url:
-                st.link_button("🔗 Open Careers", careers_url, use_container_width=True)
+                row_cols[3].markdown(f"[Open]({careers_url})")
             else:
-                st.caption("No careers URL configured.")
-    
+                row_cols[3].write("-")
+
+            if active:
+                row_cols[4].markdown("<span style='color:#16a34a; font-weight:600;'>Active</span>", unsafe_allow_html=True)
+            else:
+                row_cols[4].markdown("<span style='color:#dc2626; font-weight:600;'>Inactive</span>", unsafe_allow_html=True)
+
+            toggle_label = "Deactivate" if active else "Activate"
+            if row_cols[5].button(toggle_label, key=f"toggle_company_{company.get('id', company.get('name'))}"):
+                updated_companies = []
+                for current in companies:
+                    if current.get("id") == company.get("id"):
+                        updated = dict(current)
+                        updated["active"] = not active
+                        updated_companies.append(updated)
+                    else:
+                        updated_companies.append(current)
+                save_companies(companies_path, updated_companies)
+                st.rerun()
+
+            if row_cols[6].button("Delete", key=f"delete_company_{company.get('id', company.get('name'))}"):
+                updated_companies = [c for c in companies if c.get("id") != company.get("id")]
+                save_companies(companies_path, updated_companies)
+                st.success(f"Deleted {company.get('name', 'company')}.")
+                st.rerun()
+
     st.markdown("---")
-    st.subheader("🔄 Scan for Open Roles")
-
-    use_real_scraper = st.checkbox(
-        "Use Real Scraper (Playwright)",
-        value=st.session_state.get("use_real_scraper", False),
-        help="When enabled, attempts real web scraping and falls back to mock if unavailable."
-    )
-    st.session_state.use_real_scraper = use_real_scraper
-    max_jobs = st.slider("Max jobs per company", min_value=1, max_value=5, value=2)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🔍 Scan All Companies", use_container_width=True):
-            progress_bar = st.progress(0)
-            progress_status = st.empty()
-
-            total_companies = len(filtered_companies)
-            jobs = []
-
-            if total_companies == 0:
-                progress_status.text("No companies configured to scan.")
-                st.info("No companies found in data source.")
-            else:
-                for idx, company in enumerate(filtered_companies, start=1):
-                    progress_status.text(f"Scanning {idx}/{total_companies}: {company['name']}")
-                    company_jobs = []
-
-                    if use_real_scraper and HAS_REAL_SCRAPER:
-                        try:
-                            company_jobs = scrape_companies_real([company], max_jobs_per_company=max_jobs)
-                        except Exception as e:
-                            st.warning(f"Real scraper unavailable for {company['name']}, using mock mode. Reason: {str(e)[:120]}")
-
-                    if not company_jobs:
-                        company_jobs = run_async_task(
-                            scraper.scrape_company(company["name"], company["careers_url"], limit=max_jobs)
-                        )
-
-                    if company_location_filter == "California Only":
-                        company_jobs = [job for job in company_jobs if is_california_job(job)]
-
-                    jobs.extend(company_jobs)
-                    progress_bar.progress(int((idx / total_companies) * 85))
-
-                progress_status.text("Persisting scanned jobs to database...")
-                progress_bar.progress(92)
-                inserted, updated = persist_jobs(jobs)
-                progress_bar.progress(100)
-                progress_status.text(f"Completed {total_companies}/{total_companies} companies.")
-
-                st.success(f"✅ Scan complete: {len(jobs)} jobs processed ({inserted} new, {updated} updated).")
-    
-    with col2:
-        selected_company_options = [c["name"] for c in filtered_companies]
-        if not selected_company_options:
-            st.caption("No companies available for the selected filter.")
-            return
-
-        selected_company = st.selectbox("Select Company", selected_company_options)
-        if st.button("🔍 Scan Single Company", use_container_width=True):
-            company = next((c for c in filtered_companies if c["name"] == selected_company), None)
-            if not company:
-                st.error("Selected company not found.")
-                return
-
-            progress_bar = st.progress(0)
-            progress_status = st.empty()
-            progress_status.text(f"Scanning {selected_company}...")
-            progress_bar.progress(15)
-
-            jobs = []
-            if use_real_scraper and HAS_REAL_SCRAPER:
-                try:
-                    jobs = scrape_companies_real([company], max_jobs_per_company=max_jobs)
-                except Exception as e:
-                    st.warning(f"Real scraper unavailable, using mock mode. Reason: {str(e)[:120]}")
-
-            if not jobs:
-                jobs = run_async_task(scraper.scrape_company(company["name"], company["careers_url"], limit=max_jobs))
-
-            if company_location_filter == "California Only":
-                jobs = [job for job in jobs if is_california_job(job)]
-
-            progress_status.text("Persisting scanned jobs to database...")
-            progress_bar.progress(90)
-            inserted, updated = persist_jobs(jobs)
-
-            progress_bar.progress(100)
-            progress_status.text(f"Completed scan for {selected_company}.")
-            st.success(f"✅ {selected_company} scan complete: {len(jobs)} jobs ({inserted} new, {updated} updated).")
+    st.info("Scanning is now available on the Get Started page under 'Scan Active Companies for Matching Jobs'.")
 
 
 def page_add_job():
     """Manually add a job"""
     st.title("➕ Add Job Manually")
+
+    if st.button("← Back to Home", key="add_job_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
     
     tab1, tab2 = st.tabs(["Paste URL", "Paste Job Description"])
     
     with tab1:
         st.subheader("Paste Job URL")
         url = st.text_input("Job URL")
-        use_real_scraper = st.checkbox(
-            "Use Real Scraper for URL",
-            value=st.session_state.get("use_real_scraper", False)
+        use_real_scraper = is_real_scrape_mode()
+        st.caption(
+            "Real Scraper Mode (from sidebar): ON"
+            if use_real_scraper
+            else "Real Scraper Mode (from sidebar): OFF (mock generation enabled)"
         )
         
         if url and st.button("🔍 Scrape from URL"):
             st.info("🔄 Scraping job from URL...")
             job = None
 
-            if use_real_scraper and HAS_REAL_SCRAPER:
-                try:
-                    job = run_async_task(scrape_single_job_real_async(url))
-                except Exception as e:
-                    st.warning(f"Real scraper failed, falling back to mock. Reason: {str(e)[:120]}")
-
-            if not job:
+            if use_real_scraper:
+                if not HAS_REAL_SCRAPER:
+                    st.error("Real scraper mode is ON, but Playwright scraper is unavailable.")
+                else:
+                    try:
+                        job = run_async_task(scrape_single_job_real_async(url))
+                    except Exception as e:
+                        st.error(f"Real scraper failed in strict real mode. Reason: {str(e)[:120]}")
+            else:
                 job = run_async_task(scraper.scrape_single_job(url))
 
             if job:
@@ -1308,6 +1942,10 @@ def page_add_job():
 def page_settings():
     """Settings page"""
     st.title("⚙️ Settings")
+
+    if st.button("← Back to Home", key="settings_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
     
     settings = get_settings()
     
@@ -1336,6 +1974,54 @@ def page_settings():
     st.subheader("🚫 Blacklist")
     blacklist = st.text_area("Companies to Exclude (one per line)", 
                              value="\n".join(settings.get("blacklist", [])))
+
+    st.subheader("🔔 Job Alerts")
+    alerts_enabled = st.checkbox("Enable job alerts", value=bool(settings.get("alerts_enabled", False)))
+    alert_col1, alert_col2 = st.columns(2)
+    with alert_col1:
+        alert_min_score = st.slider("Alert min match score", 50, 100, int(settings.get("alert_min_score", 80)))
+    with alert_col2:
+        alert_max_items = st.slider("Max jobs per alert", 1, 25, int(settings.get("alert_max_items", 10)))
+
+    st.markdown("**Email Delivery (optional)**")
+    email_col1, email_col2 = st.columns(2)
+    with email_col1:
+        smtp_host = st.text_input("SMTP Host", value=settings.get("smtp_host", ""))
+        smtp_port = st.number_input("SMTP Port", value=int(settings.get("smtp_port", 587)), step=1)
+        smtp_user = st.text_input("SMTP User", value=settings.get("smtp_user", ""))
+    with email_col2:
+        smtp_password = st.text_input("SMTP Password", value=settings.get("smtp_password", ""), type="password")
+        alert_email_from = st.text_input("Alert From Email", value=settings.get("alert_email_from", ""))
+        alert_email_to = st.text_input("Alert To Email", value=settings.get("alert_email_to", ""))
+
+    if st.button("🔎 Check Alerts Now", use_container_width=True, disabled=not alerts_enabled):
+        pending_jobs = get_new_alert_jobs(min_score=alert_min_score, max_items=alert_max_items)
+        if not pending_jobs:
+            st.info("No new jobs matched alert criteria.")
+        else:
+            st.success(f"Found {len(pending_jobs)} new alert-worthy jobs.")
+            preview_limit = min(5, len(pending_jobs))
+            for job in pending_jobs[:preview_limit]:
+                st.caption(
+                    f"• {job.get('title')} @ {job.get('company')} | "
+                    f"Match {float(job.get('match_score', 0)):.0f}%"
+                )
+
+            temp_settings = {
+                "smtp_host": smtp_host,
+                "smtp_port": int(smtp_port),
+                "smtp_user": smtp_user,
+                "smtp_password": smtp_password,
+                "alert_email_from": alert_email_from,
+                "alert_email_to": alert_email_to,
+            }
+            email_sent, email_message = send_job_alert_email(pending_jobs, temp_settings)
+            if email_sent:
+                st.success(email_message)
+            else:
+                st.caption(email_message)
+
+            mark_alert_jobs_seen(pending_jobs)
 
     st.subheader("🧠 AI Re-scoring")
     has_openai = bool(openai_key.strip() and HAS_OPENAI_INTEGRATION)
@@ -1369,6 +2055,21 @@ def page_settings():
     
     if st.button("💾 Save Settings", use_container_width=True):
         st.session_state.openai_key_override = openai_key.strip()
+        st.session_state.settings_override = {
+            "location": location,
+            "min_salary": int(min_salary),
+            "exp_level": exp_level,
+            "blacklist": [item.strip() for item in blacklist.split("\n") if item.strip()],
+            "alerts_enabled": bool(alerts_enabled),
+            "alert_min_score": int(alert_min_score),
+            "alert_max_items": int(alert_max_items),
+            "smtp_host": smtp_host.strip(),
+            "smtp_port": int(smtp_port),
+            "smtp_user": smtp_user.strip(),
+            "smtp_password": smtp_password,
+            "alert_email_from": alert_email_from.strip(),
+            "alert_email_to": alert_email_to.strip(),
+        }
 
         if openai_key.strip() and HAS_OPENAI_INTEGRATION:
             with st.spinner("Validating OpenAI key..."):
@@ -1400,20 +2101,87 @@ def main():
         """, unsafe_allow_html=True)
         
         st.markdown("---")
+
+        st.subheader("🧪 Data Mode")
+        requested_mode = st.toggle(
+            "Real Scraper Mode",
+            key="scrape_mode_request",
+            help="ON: strict real scraping only, no mock fallback. OFF: mock data generation mode."
+        )
+
+        current_mode = bool(st.session_state.get("scrape_mode_real", False))
+
+        if not requested_mode:
+            st.session_state.suppress_real_mode_prompt = False
+
+        if st.session_state.get("pending_real_mode", False):
+            st.warning("Switching to Real mode can remove mock jobs from your database.")
+            confirm_col1, confirm_col2 = st.columns(2)
+            with confirm_col1:
+                if st.button("✅ Confirm", use_container_width=True, key="confirm_real_mode_switch"):
+                    removed = remove_mock_jobs_from_db()
+                    st.session_state.scrape_mode_real = True
+                    st.session_state.pending_real_mode = False
+                    st.session_state.suppress_real_mode_prompt = False
+                    st.success(f"Real mode enabled. Removed {removed} mock jobs from the database.")
+                    st.rerun()
+            with confirm_col2:
+                if st.button("❌ Cancel", use_container_width=True, key="cancel_real_mode_switch"):
+                    st.session_state.scrape_mode_real = False
+                    st.session_state.pending_real_mode = False
+                    st.session_state.suppress_real_mode_prompt = True
+                    st.info("Stayed in mock mode.")
+                    st.rerun()
+        else:
+            if requested_mode != current_mode:
+                if requested_mode:
+                    if not st.session_state.get("suppress_real_mode_prompt", False):
+                        st.session_state.pending_real_mode = True
+                        st.rerun()
+                else:
+                    st.session_state.scrape_mode_real = False
+                    st.session_state.suppress_real_mode_prompt = False
+                    st.info("Switched to mock mode.")
+                    st.rerun()
+
+        current_mode = bool(st.session_state.get("scrape_mode_real", False))
+        st.caption("Mode: Real-only" if current_mode else "Mode: Mock-only")
+
+        st.markdown("---")
         
-        # Navigation menu
-        nav_items = [
-            ("Dashboard", "💼 Dashboard"),
+        # Navigation menu (primary workflow)
+        primary_nav_items = [
+            ("Get Started", "🏠 Home"),
             ("Profile", "👤 Profile"),
             ("Preferred Companies", "🏢 Preferred Companies"),
-            ("Add Job", "➕ Add Job"),
-            ("Settings", "⚙️ Settings"),
+            ("Saved Jobs", "⭐ Saved Jobs"),
         ]
 
-        if st.session_state.page not in [item[0] for item in nav_items]:
-            st.session_state.page = "Dashboard"
+        secondary_nav_items = [
+            ("Settings", "⚙️ Settings"),
+            ("Add Job", "➕ Manual Add"),
+        ]
 
-        for page_key, page_label in nav_items:
+        nav_items = primary_nav_items + secondary_nav_items
+
+        if st.session_state.page not in [item[0] for item in nav_items]:
+            st.session_state.page = "Get Started"
+
+        st.caption("Main Workflow")
+        for page_key, page_label in primary_nav_items:
+            is_active = st.session_state.page == page_key
+            if st.button(
+                page_label,
+                key=f"nav_{page_key}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary"
+            ):
+                st.session_state.page = page_key
+                st.rerun()
+
+        st.markdown("---")
+        st.caption("Other Tools")
+        for page_key, page_label in secondary_nav_items:
             is_active = st.session_state.page == page_key
             if st.button(
                 page_label,
@@ -1442,19 +2210,21 @@ def main():
             1. **Upload Your Resume** → Profile page
             2. **Set Preferences** → Settings page
             3. **Add Companies** → Preferred Companies
-            4. **Browse Jobs** → Dashboard
+            4. **Scan + Browse Jobs** → Home page
             5. **Open Jobs** → Use original job links
             
             Made with ❤️ for tech job seekers.
             """)
     
     # Main content
-    if st.session_state.page == "Dashboard":
-        page_dashboard()
+    if st.session_state.page == "Get Started":
+        page_get_started()
     elif st.session_state.page == "Profile":
         page_profile()
     elif st.session_state.page == "Preferred Companies":
         page_companies()
+    elif st.session_state.page == "Saved Jobs":
+        page_saved_jobs()
     elif st.session_state.page == "Add Job":
         page_add_job()
     elif st.session_state.page == "Settings":

@@ -112,7 +112,8 @@ class MockScraper:
                                                           random.sample(template["skills"], 3),
                                                           company_name),
                 "posted_date": datetime.now(timezone.utc) - timedelta(days=random.randint(0, 30)),
-                "source": company_name
+                "source": f"{company_name} Mock",
+                "data_mode": "mock"
             }
             jobs.append(job)
         
@@ -165,7 +166,8 @@ class MockScraper:
                     "- Knowledge of policy, compliance, and service delivery\n"
                 ),
                 "posted_date": datetime.now(timezone.utc) - timedelta(days=random.randint(0, 20)),
-                "source": "California State Jobs"
+                "source": "California State Jobs Mock",
+                "data_mode": "mock"
             })
 
         return jobs
@@ -235,7 +237,8 @@ class MockScraper:
                                                       random.sample(template["skills"], 3),
                                                       company),
             "posted_date": datetime.now(timezone.utc) - timedelta(days=random.randint(0, 30)),
-            "source": company
+            "source": f"{company} Mock",
+            "data_mode": "mock"
         }
     
     def scrape_from_text(self, job_description_text: str, company_name: str = "Manual Entry") -> Optional[Dict]:
@@ -271,7 +274,8 @@ class MockScraper:
             "link": "manual-entry",
             "jd_text": job_description_text,
             "posted_date": datetime.now(timezone.utc),
-            "source": company_name
+            "source": f"{company_name} Manual",
+            "data_mode": "manual"
         }
 
 

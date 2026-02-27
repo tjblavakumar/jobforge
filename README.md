@@ -10,6 +10,8 @@ A clean, locally-deployable Streamlit application for managing and analyzing tec
 - **🏢 Preferred Companies**: Built-in company list + add/delete actions, careers URL validation, California-only filter, real-scraper mode + mock fallback
 - **➕ Add Jobs Manually**: Paste URLs (real scraper or mock fallback) or full job descriptions
 - **⚙️ Settings**: Configure OpenAI API key and one-click OpenAI re-scoring
+- **🔔 Job Alerts**: Detect new high-match jobs and optionally send SMTP email alerts
+- **📤 Export**: Download current dashboard results as CSV or PDF
 - **🎨 UI Refresh**: Blue theme + dark-mode-friendly styling updates
 - **💾 SQLite Database**: All data stored locally, never leaves your machine
 - **🌐 Offline Mode**: Works fully without OpenAI API key using local embeddings
@@ -227,6 +229,15 @@ EXP_LEVEL = "senior"
 WORK_TYPE = "remote"
 BLACKLIST = "Company1,Company2"
 FRESHNESS_DAYS = 30
+ALERTS_ENABLED = false
+ALERT_MIN_SCORE = 80
+ALERT_MAX_ITEMS = 10
+SMTP_HOST = ""
+SMTP_PORT = 587
+SMTP_USER = ""
+SMTP_PASSWORD = ""
+ALERT_EMAIL_FROM = ""
+ALERT_EMAIL_TO = ""
 ```
 
 ### `.env` (Alternative)
@@ -235,6 +246,9 @@ FRESHNESS_DAYS = 30
 OPENAI_API_KEY=sk-...
 LOCATION=United States
 MIN_SALARY=100000
+ALERTS_ENABLED=false
+ALERT_MIN_SCORE=80
+ALERT_MAX_ITEMS=10
 ```
 
 ## 🔐 Security & Privacy
@@ -265,9 +279,9 @@ Delete `data/jobs.db` to reset.
 - [x] **Sort Controls**: Best Match, Newest, Highest Salary
 - [x] **Company Management**: Add/delete company sources + URL validation
 - [x] **Theme Refresh**: Blue color system + dark-mode improvements
-- [ ] **Async Scraping**: Full parallel multi-company scraping pipeline
-- [ ] **Job Alerts**: Email/push notifications for new matches
-- [ ] **Export**: CSV/PDF exports
+- [x] **Async Scraping**: Full parallel multi-company scraping pipeline
+- [x] **Job Alerts**: New-match detection with optional SMTP email delivery
+- [x] **Export**: CSV/PDF exports from current dashboard results
 
 ### Phase 4 (Multi-User & Cloud)
 - [ ] **Cloud Warehouse**: Optional sync (encrypted)
