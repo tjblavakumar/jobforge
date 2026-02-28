@@ -425,6 +425,7 @@ def get_settings():
         "openai_key": openai_key,
         "location": _get_value("LOCATION", "US"),
         "min_salary": _get_int_value("MIN_SALARY", 100000),
+        "min_match_score": _get_int_value("MIN_MATCH_SCORE", 50),
         "exp_level": _get_value("EXP_LEVEL", "senior"),
         "blacklist": blacklist,
         "alerts_enabled": _get_bool_value("ALERTS_ENABLED", False),
@@ -470,6 +471,75 @@ def save_search_presets(presets):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(presets, f, indent=2, ensure_ascii=False)
+
+
+def get_source_validation_path():
+    """Path for source validation status records."""
+    return os.path.join(os.path.dirname(__file__), "data", "source_validation.json")
+
+
+def load_source_validation():
+    """Load source validation records."""
+    path = get_source_validation_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_source_validation(records):
+    """Persist source validation records."""
+    path = get_source_validation_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+
+def record_source_validation(company: dict, mode: str, jobs_count: int, success: bool, detail: str = ""):
+    """Upsert source validation status for a company."""
+    records = load_source_validation()
+    key = str(company.get("id") or company.get("name") or "unknown")
+    records[key] = {
+        "company": company.get("name", "Unknown"),
+        "url": company.get("careers_url", ""),
+        "mode": mode,
+        "success": bool(success),
+        "jobs_count": int(jobs_count),
+        "detail": detail,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_source_validation(records)
+
+
+def scan_company_jobs(company: dict, use_real_scraper: bool, max_jobs: int, max_concurrency: int):
+    """Scan a single company and return jobs + status metadata."""
+    mode = "real" if use_real_scraper else "mock"
+    jobs = []
+    detail = ""
+
+    if use_real_scraper:
+        if not HAS_REAL_SCRAPER:
+            detail = "Playwright scraper unavailable"
+            return jobs, {"success": False, "mode": mode, "detail": detail}
+        try:
+            jobs = scrape_companies_real(
+                [company],
+                max_jobs_per_company=max_jobs,
+                max_concurrency=max_concurrency,
+            )
+            detail = "ok" if jobs else "No valid job-detail pages found"
+            return jobs, {"success": bool(jobs), "mode": mode, "detail": detail}
+        except Exception as exc:
+            detail = str(exc)[:180]
+            return jobs, {"success": False, "mode": mode, "detail": detail}
+
+    jobs = run_async_task(scraper.scrape_company(company["name"], company["careers_url"], limit=max_jobs))
+    detail = "ok" if jobs else "No jobs returned by mock scraper"
+    return jobs, {"success": bool(jobs), "mode": mode, "detail": detail}
 
 def get_salary_range_display(min_sal, max_sal):
     """Format salary range"""
@@ -777,6 +847,7 @@ def persist_jobs(jobs, selected_profiles=None):
     if not profiles:
         profiles = [get_user_profile()]
     settings = get_settings()
+    min_match_score = float(settings.get("min_match_score", 50))
     api_key = (settings.get("openai_key") or "").strip()
     use_openai = bool(api_key)
     matcher = get_matcher(use_openai=use_openai, api_key=api_key if use_openai else None)
@@ -790,46 +861,38 @@ def persist_jobs(jobs, selected_profiles=None):
         link = job.get("link") or f"manual-{job.get('company', 'company')}-{job.get('title', 'role')}"
         existing = session.query(Job).filter_by(link=link).first()
 
-        if existing:
-            db_job = existing
-            updated += 1
-        else:
-            db_job = Job(link=link)
-            inserted += 1
+        candidate_title = job.get("title", "Job Position")
+        candidate_company = job.get("company", "Unknown Company")
+        candidate_location = job.get("location", "Unknown")
+        candidate_salary_min = job.get("salary_min") or 0
+        candidate_salary_max = job.get("salary_max") or 0
+        candidate_is_remote = bool(job.get("is_remote", False))
+        candidate_jd_text = job.get("jd_text", "")
+        candidate_posted_date = job.get("posted_date") or datetime.now(timezone.utc)
 
-        db_job.title = job.get("title", "Job Position")
-        db_job.company = job.get("company", "Unknown Company")
-        db_job.location = job.get("location", "Unknown")
-        db_job.salary_min = job.get("salary_min") or 0
-        db_job.salary_max = job.get("salary_max") or 0
-        db_job.is_remote = bool(job.get("is_remote", False))
-        db_job.jd_text = job.get("jd_text", "")
-        db_job.posted_date = job.get("posted_date") or datetime.now(timezone.utc)
-        source_value = job.get("source", db_job.company)
+        source_value = job.get("source", candidate_company)
         data_mode = str(job.get("data_mode", "")).strip().lower()
         if data_mode == "mock" and "mock" not in str(source_value).lower():
             source_value = f"{source_value} [Mock]"
         elif data_mode == "real" and "real" not in str(source_value).lower():
             source_value = f"{source_value} [Real]"
-        db_job.source = source_value
-
-        session.merge(db_job)
-        session.flush()
 
         best_score = 0.0
         best_breakdown = {"semantic_match": 0.0, "openai_score": 0.0}
 
+        candidate_job_payload = {
+            "title": candidate_title,
+            "company": candidate_company,
+            "location": candidate_location,
+            "salary_min": candidate_salary_min,
+            "salary_max": candidate_salary_max,
+            "is_remote": candidate_is_remote,
+            "jd_text": candidate_jd_text,
+        }
+
         for profile in profiles:
             score, breakdown = matcher.score_job(
-                {
-                    "title": db_job.title,
-                    "company": db_job.company,
-                    "location": db_job.location,
-                    "salary_min": db_job.salary_min,
-                    "salary_max": db_job.salary_max,
-                    "is_remote": db_job.is_remote,
-                    "jd_text": db_job.jd_text,
-                },
+                candidate_job_payload,
                 {
                     "title": profile.get("title", "Professional"),
                     "years_exp": profile.get("years_exp", 0),
@@ -843,6 +906,32 @@ def persist_jobs(jobs, selected_profiles=None):
             if float(score) >= float(best_score):
                 best_score = float(score)
                 best_breakdown = breakdown or {"semantic_match": 0.0, "openai_score": 0.0}
+
+        if float(best_score) < float(min_match_score):
+            if existing:
+                session.query(JobMetric).filter_by(job_id=existing.id).delete(synchronize_session=False)
+                session.query(Job).filter_by(id=existing.id).delete(synchronize_session=False)
+            continue
+
+        if existing:
+            db_job = existing
+            updated += 1
+        else:
+            db_job = Job(link=link)
+            inserted += 1
+
+        db_job.title = candidate_title
+        db_job.company = candidate_company
+        db_job.location = candidate_location
+        db_job.salary_min = candidate_salary_min
+        db_job.salary_max = candidate_salary_max
+        db_job.is_remote = candidate_is_remote
+        db_job.jd_text = candidate_jd_text
+        db_job.posted_date = candidate_posted_date
+        db_job.source = source_value
+
+        session.merge(db_job)
+        session.flush()
 
         metric = session.query(JobMetric).filter_by(job_id=db_job.id).first()
         if not metric:
@@ -1094,21 +1183,17 @@ def page_get_started():
                 progress_status.text(f"Scanning {selected_company}...")
                 progress_bar.progress(15)
 
-                jobs = []
-                if use_real_scraper:
-                    if not HAS_REAL_SCRAPER:
-                        st.error("Real scraper mode is ON, but Playwright scraper is unavailable.")
-                    else:
-                        try:
-                            jobs = scrape_companies_real(
-                                [company],
-                                max_jobs_per_company=max_jobs,
-                                max_concurrency=max_concurrency
-                            )
-                        except Exception as e:
-                            st.error(f"Real scraper failed in strict real mode. Reason: {str(e)[:120]}")
-                else:
-                    jobs = run_async_task(scraper.scrape_company(company["name"], company["careers_url"], limit=max_jobs))
+                jobs, status = scan_company_jobs(company, use_real_scraper, max_jobs, max_concurrency)
+                record_source_validation(
+                    company,
+                    mode=status.get("mode", "real" if use_real_scraper else "mock"),
+                    jobs_count=len(jobs),
+                    success=status.get("success", False),
+                    detail=status.get("detail", ""),
+                )
+
+                if use_real_scraper and not status.get("success") and status.get("detail"):
+                    st.warning(f"{company['name']}: {status.get('detail')}")
 
                 progress_status.text("Persisting scanned jobs to database...")
                 progress_bar.progress(90)
@@ -1136,31 +1221,18 @@ def page_get_started():
             total_companies = len(active_companies)
             jobs = []
             progress_status.text(f"Running scan for {total_companies} active companies...")
-            progress_bar.progress(20)
-
-            if use_real_scraper:
-                if not HAS_REAL_SCRAPER:
-                    st.error("Real scraper mode is ON, but Playwright scraper is unavailable.")
-                    jobs = []
-                else:
-                    try:
-                        jobs = scrape_companies_real(
-                            active_companies,
-                            max_jobs_per_company=max_jobs,
-                            max_concurrency=max_concurrency
-                        )
-                    except Exception as e:
-                        st.error(f"Real scraper failed in strict real mode. Reason: {str(e)[:120]}")
-                        jobs = []
-            else:
-                jobs_by_company = run_async_task(
-                    scrape_mock_companies_parallel(
-                        active_companies,
-                        limit=max_jobs,
-                        max_concurrency=max_concurrency
-                    )
+            for idx, company in enumerate(active_companies, start=1):
+                progress_status.text(f"Scanning {idx}/{total_companies}: {company['name']}")
+                company_jobs, status = scan_company_jobs(company, use_real_scraper, max_jobs, max_concurrency)
+                jobs.extend(company_jobs)
+                record_source_validation(
+                    company,
+                    mode=status.get("mode", "real" if use_real_scraper else "mock"),
+                    jobs_count=len(company_jobs),
+                    success=status.get("success", False),
+                    detail=status.get("detail", ""),
                 )
-                jobs = [job for company_jobs in jobs_by_company.values() for job in company_jobs]
+                progress_bar.progress(min(90, int((idx / max(1, total_companies)) * 80) + 10))
 
             progress_status.text("Persisting scanned jobs to database...")
             progress_bar.progress(92)
@@ -1573,6 +1645,37 @@ def page_saved_jobs():
                         st.rerun()
                     else:
                         st.warning("Job not found.")
+
+
+def page_source_validation():
+    """Show validation status per company source."""
+    st.title("✅ Source Validation")
+
+    if st.button("← Back to Home", key="source_validation_back_home"):
+        st.session_state.page = "Get Started"
+        st.rerun()
+
+    records = load_source_validation()
+    if not records:
+        st.info("No validation records yet. Run scans from Home to populate this page.")
+        return
+
+    rows = []
+    for _, entry in records.items():
+        rows.append(
+            {
+                "Company": entry.get("company", "Unknown"),
+                "Mode": entry.get("mode", "-"),
+                "Status": "Success" if entry.get("success") else "Failed",
+                "Jobs": int(entry.get("jobs_count", 0)),
+                "Checked At": entry.get("checked_at", "-"),
+                "Detail": entry.get("detail", ""),
+                "URL": entry.get("url", ""),
+            }
+        )
+
+    rows.sort(key=lambda item: item.get("Checked At", ""), reverse=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 def page_profile():
@@ -2160,6 +2263,7 @@ def main():
         secondary_nav_items = [
             ("Settings", "⚙️ Settings"),
             ("Add Job", "➕ Manual Add"),
+            ("Source Validation", "✅ Source Validation"),
         ]
 
         nav_items = primary_nav_items + secondary_nav_items
@@ -2225,6 +2329,8 @@ def main():
         page_companies()
     elif st.session_state.page == "Saved Jobs":
         page_saved_jobs()
+    elif st.session_state.page == "Source Validation":
+        page_source_validation()
     elif st.session_state.page == "Add Job":
         page_add_job()
     elif st.session_state.page == "Settings":

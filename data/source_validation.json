@@ -1,0 +1,29 @@
+{
+  "22": {
+    "company": "TCS ENTRY",
+    "url": "https://www.tcs.com/careers/india/entry-level",
+    "mode": "real",
+    "success": false,
+    "jobs_count": 0,
+    "detail": "No valid job-detail pages found",
+    "checked_at": "2026-02-27T20:45:54.424796+00:00"
+  },
+  "23": {
+    "company": "INFOSYS INDIA",
+    "url": "https://career.infosys.com/joblist?countrycode=IN&companyhiringtype=IL",
+    "mode": "mock",
+    "success": true,
+    "jobs_count": 2,
+    "detail": "ok",
+    "checked_at": "2026-02-28T02:41:25.014168+00:00"
+  },
+  "21": {
+    "company": "California State Jobs (CalCareers)",
+    "url": "https://calcareers.ca.gov/CalHRPublic/Search/JobSearchResults.aspx",
+    "mode": "mock",
+    "success": true,
+    "jobs_count": 2,
+    "detail": "ok",
+    "checked_at": "2026-02-28T02:41:23.567226+00:00"
+  }
+}

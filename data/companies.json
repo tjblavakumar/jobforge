@@ -6,7 +6,7 @@
       "careers_url": "https://www.amazon.jobs/en/search",
       "industry": "Technology",
       "logo": "🔶",
-      "active": true
+      "active": false
     },
     {
       "id": 21,
@@ -15,7 +15,7 @@
       "industry": "Government/Public Sector",
       "logo": "🐻",
       "state": "CA",
-      "active": false
+      "active": true
     },
     {
       "id": 22,
@@ -30,7 +30,8 @@
       "name": "INFOSYS INDIA",
       "careers_url": "https://career.infosys.com/joblist?countrycode=IN&companyhiringtype=IL",
       "industry": "Technology",
-      "logo": "🏢"
+      "logo": "🏢",
+      "active": true
     }
   ]
 }

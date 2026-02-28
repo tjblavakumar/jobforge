@@ -52,6 +52,34 @@ class PlaywrightScraper:
         "log in", "login", "sign in", "register", "forgot password",
         "recruitment fraud", "validate and accept offer", "candidate id"
     }
+
+    CORPORATE_PAGE_KEYWORDS = {
+        "what we do", "who we are", "insights", "newsroom", "investors",
+        "skip to main content", "skip to footer", "contact us", "global",
+        "seize the future", "shape the future", "the tcs difference",
+        "our inclusive workplaces", "design-thinking philosophy"
+    }
+
+    JOB_SIGNAL_KEYWORDS = {
+        "responsibilities", "requirements", "qualifications", "skills",
+        "experience", "job description", "role", "position", "apply",
+        "requisition", "employment", "full-time", "part-time"
+    }
+
+    TCS_MARKETING_SIGNATURES = {
+        "the tcs difference",
+        "our research and innovation",
+        "our inclusive workplaces",
+        "our design-thinking philosophy",
+        "shape the future of technology",
+    }
+
+    ENTRY_CLICK_KEYWORDS = {
+        "early career", "early careers", "lateral", "experienced",
+        "professional", "students", "graduates", "university",
+        "search jobs", "view jobs", "find jobs", "explore jobs", "all jobs",
+        "see opportunities", "browse jobs", "job search"
+    }
     
     def __init__(self, headless: bool = True):
         """Initialize scraper with Playwright"""
@@ -206,6 +234,9 @@ class PlaywrightScraper:
             # Navigate
             await page.goto(careers_url, wait_until="networkidle", timeout=30000)
             await asyncio.sleep(1)
+
+            # Try to expand common entry pages (early careers/lateral/search jobs, etc.)
+            await self._expand_job_entry_points(page)
             
             # Try to find job links (generic selectors)
             job_selectors = [
@@ -282,7 +313,141 @@ class PlaywrightScraper:
         if "greenhouse.io" in host:
             return await asyncio.to_thread(self._scrape_greenhouse_api, careers_url, company_name, max_jobs)
 
+        if "workday" in host or "myworkdayjobs.com" in host or "myworkday.com" in host:
+            return await self._scrape_workday_jobs(careers_url, company_name, max_jobs)
+
+        if "successfactors" in host:
+            return await self._scrape_successfactors_jobs(careers_url, company_name, max_jobs)
+
+        major_enterprise_hosts = {
+            "tcs.com",
+            "infosys.com",
+            "accenture.com",
+            "wellsfargo.com",
+            "bankofamerica.com",
+            "bofa.com",
+        }
+        if any(domain in host for domain in major_enterprise_hosts):
+            return await self._scrape_enterprise_portal_jobs(careers_url, company_name, max_jobs)
+
         return []
+
+    async def _scrape_enterprise_portal_jobs(self, careers_url: str, company_name: str, max_jobs: int) -> List[Dict]:
+        """Enterprise careers pages often need entry clicks + ATS outbound link discovery."""
+        try:
+            page: Page = await self.context.new_page()
+            delay = random.uniform(*self.request_delay)
+            await asyncio.sleep(delay)
+            await page.goto(careers_url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(1)
+
+            await self._expand_job_entry_points(page)
+            candidate_links = await self._extract_candidate_links_from_page(page, careers_url, max_jobs=max_jobs * 6)
+
+            # Add ATS outbound links discovered in all anchors
+            all_anchor_links = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                    href: a.getAttribute('href') || '',
+                    text: (a.innerText || '').trim()
+                }))"""
+            )
+            await page.close()
+
+            ats_hosts = (
+                "myworkdayjobs.com", "workday", "greenhouse.io", "lever.co",
+                "successfactors", "icims", "smartrecruiters", "taleo", "brassring"
+            )
+            for item in all_anchor_links or []:
+                href = self._to_absolute_url(careers_url, (item or {}).get("href", ""))
+                text = (item or {}).get("text", "")
+                lowered = href.lower()
+                if any(token in lowered for token in ats_hosts) and self._is_valid_job_link(href, text):
+                    candidate_links.append((href, text))
+
+            # Deduplicate + rank
+            deduped = []
+            seen = set()
+            for link, text in candidate_links:
+                key = link.lower().strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append((link, text))
+
+            ranked = sorted(deduped, key=lambda item: self._job_link_score(item[0], item[1]), reverse=True)
+
+            jobs = []
+            for link, _ in ranked[: max_jobs * 4]:
+                if len(jobs) >= max_jobs:
+                    break
+
+                parsed = urlparse(link)
+                link_host = (parsed.netloc or "").lower()
+
+                # ATS board links: use adapter directly
+                adapter_jobs = []
+                if "myworkdayjobs.com" in link_host or "workday" in link_host:
+                    adapter_jobs = await self._scrape_workday_jobs(link, company_name, max_jobs)
+                elif "greenhouse.io" in link_host:
+                    adapter_jobs = await asyncio.to_thread(self._scrape_greenhouse_api, link, company_name, max_jobs)
+                elif "lever.co" in link_host:
+                    adapter_jobs = await asyncio.to_thread(self._scrape_lever_api, link, company_name, max_jobs)
+                elif "successfactors" in link_host:
+                    adapter_jobs = await self._scrape_successfactors_jobs(link, company_name, max_jobs)
+
+                if adapter_jobs:
+                    for job in adapter_jobs:
+                        if len(jobs) >= max_jobs:
+                            break
+                        jobs.append(job)
+                    continue
+
+                # Otherwise, try direct detail scraping
+                job = await self.scrape_job_post(link, company_name)
+                if job:
+                    jobs.append(job)
+
+            return jobs
+        except Exception:
+            return []
+
+    async def _scrape_workday_jobs(self, careers_url: str, company_name: str, max_jobs: int) -> List[Dict]:
+        """Use Workday listing endpoint discovery, then scrape detail pages for quality JD text."""
+        links = await asyncio.to_thread(self._discover_workday_links, careers_url, max_jobs)
+        if not links:
+            return []
+
+        jobs = []
+        for link in links[: max_jobs * 2]:
+            if len(jobs) >= max_jobs:
+                break
+            job = await self.scrape_job_post(link, company_name)
+            if job:
+                jobs.append(job)
+        return jobs
+
+    async def _scrape_successfactors_jobs(self, careers_url: str, company_name: str, max_jobs: int) -> List[Dict]:
+        """Handle SuccessFactors-style flows by expanding entry options and collecting job-detail links."""
+        try:
+            page: Page = await self.context.new_page()
+            delay = random.uniform(*self.request_delay)
+            await asyncio.sleep(delay)
+            await page.goto(careers_url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(1)
+
+            await self._expand_job_entry_points(page)
+            candidate_links = await self._extract_candidate_links_from_page(page, careers_url, max_jobs=max_jobs * 3)
+            await page.close()
+
+            jobs = []
+            for link, _ in candidate_links:
+                if len(jobs) >= max_jobs:
+                    break
+                job = await self.scrape_job_post(link, company_name)
+                if job:
+                    jobs.append(job)
+            return jobs
+        except Exception:
+            return []
 
     def _scrape_lever_api(self, careers_url: str, company_name: str, max_jobs: int) -> List[Dict]:
         """Fetch jobs from Lever public postings API."""
@@ -416,6 +581,131 @@ class PlaywrightScraper:
             return jobs
         except Exception:
             return []
+
+    def _discover_workday_links(self, careers_url: str, max_jobs: int) -> List[str]:
+        """Discover Workday job links via CXS endpoint if available."""
+        if 'requests' not in globals():
+            return []
+
+        try:
+            response = requests.get(careers_url, timeout=20)
+            if response.status_code >= 400:
+                return []
+            html = response.text
+
+            endpoint_match = re.search(r"(/wday/cxs/[^\"'\s]+/[^\"'\s]+/jobs)", html)
+            if not endpoint_match:
+                return []
+
+            parsed = urlparse(careers_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            endpoint = endpoint_match.group(1)
+            api_url = urljoin(origin, endpoint)
+
+            payload = {
+                "appliedFacets": {},
+                "limit": max(20, max_jobs * 5),
+                "offset": 0,
+                "searchText": "",
+            }
+            headers = {"Content-Type": "application/json"}
+            jobs_resp = requests.post(api_url, json=payload, headers=headers, timeout=25)
+            if jobs_resp.status_code >= 400:
+                return []
+
+            data = jobs_resp.json()
+            postings = data.get("jobPostings") if isinstance(data, dict) else None
+            if not isinstance(postings, list):
+                return []
+
+            links = []
+            for posting in postings:
+                ext = (posting.get("externalPath") or "").strip()
+                if not ext:
+                    continue
+                link = urljoin(origin, ext if ext.startswith("/") else f"/{ext}")
+                links.append(link)
+
+            # Deduplicate preserve order
+            deduped = []
+            seen = set()
+            for link in links:
+                key = link.lower().strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(link)
+
+            return deduped[:max_jobs * 3]
+        except Exception:
+            return []
+
+    async def _expand_job_entry_points(self, page: Page):
+        """Click common entry-point buttons/links that reveal real job search pages."""
+        click_selectors = [
+            "a", "button", "[role='button']", "div[role='link']"
+        ]
+        for selector in click_selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+            except Exception:
+                continue
+
+            for element in elements[:120]:
+                try:
+                    text = (await element.inner_text() or "").strip().lower()
+                    if not text:
+                        continue
+                    if not any(keyword in text for keyword in self.ENTRY_CLICK_KEYWORDS):
+                        continue
+
+                    await element.click(timeout=1500)
+                    await asyncio.sleep(1)
+                except Exception:
+                    continue
+
+    async def _extract_candidate_links_from_page(self, page: Page, base_url: str, max_jobs: int = 20) -> List[tuple]:
+        """Extract candidate job links from an already-loaded page."""
+        selectors = [
+            "a[href*='job']",
+            "a[href*='jobs']",
+            "a[href*='position']",
+            "a[href*='requisition']",
+            "a[href*='career']",
+            ".job-posting a[href]",
+            "[class*='job'] a[href]",
+            "[data-job-id] a[href]",
+            "a[href*='jobReqId']",
+        ]
+
+        raw_links = []
+        for selector in selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+            except Exception:
+                continue
+
+            for elem in elements:
+                try:
+                    href = await elem.get_attribute("href")
+                    text = (await elem.inner_text() or "").strip()
+                except Exception:
+                    continue
+                if not href:
+                    continue
+                absolute = self._to_absolute_url(base_url, href)
+                if self._is_valid_job_link(absolute, text):
+                    raw_links.append((absolute, text))
+
+        deduped = []
+        seen = set()
+        for link, text in raw_links:
+            key = link.lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append((link, text))
+
+        ranked = sorted(deduped, key=lambda item: self._job_link_score(item[0], item[1]), reverse=True)
+        return ranked[:max_jobs]
     
     async def scrape_multiple_companies(self, companies: List[Dict], 
                                        max_jobs_per_company: int = 3,
@@ -462,6 +752,9 @@ class PlaywrightScraper:
             return None
 
         text_content = self._clean_job_text(text_content)
+        if not self._looks_like_real_job_page(text_content, url):
+            return None
+
         lines = text_content.split('\n')
         
         # Extract title (usually first substantive line)
@@ -526,7 +819,11 @@ class PlaywrightScraper:
         if any(word in lowered for word in self.EXCLUDE_LINK_KEYWORDS):
             return False
 
-        if any(word in lowered for word in self.POSITIVE_LINK_KEYWORDS):
+        strong_job_tokens = {"job", "jobs", "requisition", "position", "opening", "vacancy", "jobreqid"}
+        if any(word in lowered for word in strong_job_tokens):
+            return True
+
+        if "apply" in lowered and re.search(r"[0-9]{3,}", lowered):
             return True
 
         # Accept URLs with likely unique job IDs
@@ -562,6 +859,39 @@ class PlaywrightScraper:
         collapsed = "\n".join(cleaned)
         # Keep a practical max length
         return collapsed[:5000]
+
+    def _looks_like_real_job_page(self, text: str, url: str) -> bool:
+        """Reject corporate landing pages and keep likely job descriptions only."""
+        lowered = (text or "").lower()
+        url_l = (url or "").lower()
+
+        if len(lowered.strip()) < 200:
+            return False
+
+        # Corporate/marketing-heavy page guard
+        corporate_hits = sum(1 for keyword in self.CORPORATE_PAGE_KEYWORDS if keyword in lowered)
+        job_hits = sum(1 for keyword in self.JOB_SIGNAL_KEYWORDS if keyword in lowered)
+
+        # Hard reject for known TCS brand/landing signatures
+        tcs_hits = sum(1 for keyword in self.TCS_MARKETING_SIGNATURES if keyword in lowered)
+        if tcs_hits >= 2:
+            return False
+
+        # If many corporate signals and almost no job signals, reject
+        if corporate_hits >= 2 and job_hits <= 2:
+            return False
+
+        # Require at least a few job-specific indicators unless URL clearly looks like job-detail
+        url_looks_job_detail = bool(re.search(r"(job|jobs|requisition|position|opening|vacancy|jobreqid)", url_l))
+        if job_hits < 2 and not url_looks_job_detail:
+            return False
+
+        # Reject giant navigation pages with too few line breaks into sections
+        section_like = lowered.count("requirements") + lowered.count("responsibilities") + lowered.count("qualifications")
+        if section_like == 0 and job_hits < 3:
+            return False
+
+        return True
 
 
 # Async runner function for sync contexts
